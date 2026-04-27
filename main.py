@@ -9,6 +9,8 @@ Rotas:
   POST /modulos/rh/analisar             → upload CSV
   POST /modulos/marketing/analisar      → upload CSV
   POST /modulos/texto/gerar             → geração de texto (sem upload)
+  POST /modulos/arcane-teste/analisar   → análise freemium com paywall
+  GET  /modulos/arcane-teste/analise/{id} → busca análise (preview ou completo)
   POST /webhooks/kirvano                → recebe eventos de pagamento
 """
 
@@ -18,7 +20,7 @@ import re
 import json
 import hmac
 import hashlib
-from typing import Optional
+from typing import Optional, List
 
 import anthropic
 import pandas as pd
@@ -47,7 +49,7 @@ SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")  # service_rol
 # ─────────────────────────────────────────
 # App
 # ─────────────────────────────────────────
-app = FastAPI(title="Arcane Core API", version="1.1.0")
+app = FastAPI(title="Arcane Core API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -304,15 +306,12 @@ Estrutura obrigatória:
 
 # ─────────────────────────────────────────
 # MÓDULO 5 — TEXTO GENÉRICO (sem upload)
-# Atende: gerar contrato, NDA, copy de vendas, posts, proposta comercial,
-# e-mail, ata, descrição de vaga, política interna, estratégia de conteúdo,
-# projeção de cenários, diagnóstico sem dados etc.
 # ─────────────────────────────────────────
 class GerarTextoPayload(BaseModel):
-    tool: str                      # id da ferramenta, ex: "gerar_contrato"
-    module: Optional[str] = None   # id do módulo, ex: "juridico"
-    input: str                     # contexto fornecido pelo usuário
-    file_content: Optional[str] = None   # texto opcional (quando o frontend leu o arquivo)
+    tool: str
+    module: Optional[str] = None
+    input: str
+    file_content: Optional[str] = None
     file_name: Optional[str] = None
     company_name: Optional[str] = None
     sector: Optional[str] = None
@@ -380,7 +379,6 @@ Evite jargão vazio e blocos genéricos — entregue recomendações específica
         if payload.input:
             partes_user.append(f"CONTEXTO FORNECIDO PELO USUÁRIO:\n{payload.input}")
         if payload.file_content:
-            # limita para não explodir tokens
             conteudo = payload.file_content[:8000]
             partes_user.append(f"CONTEÚDO DO ARQUIVO ({payload.file_name or 'arquivo'}):\n{conteudo}")
 
@@ -398,16 +396,181 @@ Evite jargão vazio e blocos genéricos — entregue recomendações específica
 
 
 # ─────────────────────────────────────────
+# MÓDULO ARCANE TESTE — Análise freemium com paywall
+# ─────────────────────────────────────────
+class ArcaneTesteRequest(BaseModel):
+    user_id: str
+    setor: str
+    funcionarios: str
+    faturamento: str
+    areas: List[str]
+    descricao: str
+    objetivos: List[str]
+
+
+@app.post("/modulos/arcane-teste/analisar")
+async def analisar_arcane_teste(req: ArcaneTesteRequest):
+    """
+    Recebe dados estruturados do wizard, gera 2 versões via Claude:
+    - preview (~500 palavras): mostrado de graça, com gancho pra pagar
+    - completo: salvo no banco, só desbloqueia após pagamento R$47,90
+    Salva no Supabase e retorna só o preview.
+    """
+    try:
+        # ─── Mapeia áreas pra nomes legíveis ───
+        AREA_LABELS = {
+            'fin': 'Financeiro',
+            'rh': 'RH e Pessoas',
+            'mkt': 'Marketing e Vendas',
+            'ops': 'Operações',
+            'jur': 'Jurídico',
+            'est': 'Estratégia'
+        }
+        areas_nomes = [AREA_LABELS.get(a, a) for a in req.areas]
+
+        # ─── Contexto formatado pra IA ───
+        contexto = f"""DADOS DA EMPRESA:
+- Setor: {req.setor}
+- Funcionários: {req.funcionarios}
+- Faturamento mensal: {req.faturamento}
+- Áreas com problema: {', '.join(areas_nomes)}
+- Objetivos da análise: {', '.join(req.objetivos)}
+
+DESCRIÇÃO DA SITUAÇÃO (palavras do empresário):
+{req.descricao}"""
+
+        # ─── PREVIEW (~500 palavras, tom direto, termina criando expectativa) ───
+        system_preview = """Você é o Arcane, consultor empresarial sênior brasileiro com tom direto e objetivo. Sem enrolação. Foco em ação.
+
+Você está gerando o PREVIEW (parte gratuita) de um diagnóstico. Esse preview deve:
+- Identificar a dor central com clareza
+- Mostrar 1-2 insights iniciais que provem que você entendeu o problema
+- Apontar de forma resumida o RUMO da solução
+- TERMINAR criando expectativa: o cliente precisa querer ver o resto
+
+REGRAS:
+- Máximo 500 palavras
+- Tom direto, sem clichês de consultor ("é importante notar", "vale ressaltar")
+- Use linguagem que o dono de pequeno negócio entende
+- Pode usar números aproximados quando fizer sentido
+- NÃO entregue o plano de ação completo (isso fica pro completo)
+- TERMINE com algo como "Identifiquei X ações concretas que vão resolver isso..." (deixa gancho)
+
+Responda em texto corrido, com parágrafos. SEM markdown, SEM listas com bullets."""
+
+        preview_text = chamar_claude(system_preview, contexto, max_tokens=1200, temperature=0.4).strip()
+
+        # ─── COMPLETO (análise inteira) ───
+        system_completo = """Você é o Arcane, consultor empresarial sênior brasileiro com tom direto e objetivo. Sem enrolação. Foco em ação.
+
+Você está gerando a ANÁLISE COMPLETA (versão paga) de um diagnóstico. Estruture em 4 seções:
+
+1. DIAGNÓSTICO COMPLETO
+   - Análise profunda da situação
+   - Causas-raiz identificadas
+   - Riscos específicos se nada for feito
+
+2. PLANO DE AÇÃO (5-7 ações concretas)
+   - Cada ação numerada com o QUE fazer e COMO fazer
+   - Priorize por impacto x esforço
+   - Inclua prazos sugeridos
+
+3. ESTIMATIVA DE IMPACTO
+   - Quanto pode economizar/ganhar em R$ aplicando o plano
+   - Em qual prazo
+
+4. PRÓXIMOS PASSOS
+   - Por onde começar essa semana
+   - Quais decisões precisa tomar primeiro
+
+REGRAS:
+- Tom direto, sem clichês
+- Use números, prazos e nomes específicos quando possível
+- Linguagem do dono de pequeno negócio
+- Responda em texto corrido com seções numeradas
+
+Use markdown simples (## para títulos das 4 seções, números pra ações)."""
+
+        completo_text = chamar_claude(system_completo, contexto, max_tokens=3000, temperature=0.4).strip()
+
+        # ─── Salva no Supabase ───
+        supa = get_supabase_admin()
+        if not supa:
+            raise HTTPException(status_code=500, detail="Supabase admin não configurado.")
+
+        result = supa.table("arcane_teste_analyses").insert({
+            "user_id": req.user_id,
+            "setor": req.setor,
+            "funcionarios": req.funcionarios,
+            "faturamento": req.faturamento,
+            "areas": req.areas,
+            "descricao": req.descricao,
+            "objetivos": req.objetivos,
+            "preview": preview_text,
+            "completo": completo_text,
+            "unlocked": False,
+        }).execute()
+
+        analysis_id = result.data[0]["id"] if result.data else None
+
+        # ─── Retorna SÓ o preview ───
+        return {
+            "status": "sucesso",
+            "analysis_id": analysis_id,
+            "preview": preview_text,
+            "unlocked": False,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro: {str(e)}")
+
+
+@app.get("/modulos/arcane-teste/analise/{analysis_id}")
+async def buscar_analise(analysis_id: str, user_id: str):
+    """
+    Busca uma análise. Se unlocked=True, retorna preview+completo.
+    Se False, retorna só preview.
+    """
+    try:
+        supa = get_supabase_admin()
+        if not supa:
+            raise HTTPException(status_code=500, detail="Supabase admin não configurado.")
+
+        result = supa.table("arcane_teste_analyses") \
+            .select("*") \
+            .eq("id", analysis_id) \
+            .eq("user_id", user_id) \
+            .single() \
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Análise não encontrada")
+
+        data = result.data
+        return {
+            "status": "sucesso",
+            "analysis_id": data["id"],
+            "preview": data["preview"],
+            "completo": data["completo"] if data["unlocked"] else None,
+            "unlocked": data["unlocked"],
+            "created_at": data["created_at"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro: {str(e)}")
+
+
+# ─────────────────────────────────────────
 # WEBHOOK — KIRVANO
 # ─────────────────────────────────────────
-# Mapa produto Kirvano → plano no Supabase.
-# Preencha com os IDs reais dos produtos depois de criar na Kirvano.
 KIRVANO_PRODUCT_MAP = {
     # "id-do-produto-na-kirvano": "essencial",
     # "id-do-produto-na-kirvano": "profissional",
     # "id-do-produto-na-kirvano": "gestao",
 }
-# Alternativa: mapear por nome do produto (menos robusto, mas útil em bootstrap)
 KIRVANO_PRODUCT_NAME_MAP = {
     "arcane essencial": "essencial",
     "arcane profissional": "profissional",
@@ -435,16 +598,9 @@ async def webhook_kirvano(
 ):
     """
     Recebe eventos da Kirvano e atualiza o plano do usuário no Supabase.
-    Configure na Kirvano:
-      - URL da integração: https://SEU-BACKEND/webhooks/kirvano
-      - Token: o valor de KIRVANO_WEBHOOK_TOKEN (env var)
-    Eventos tratados:
-      - SALE_APPROVED → promove usuário ao plano
-      - SUBSCRIPTION_CANCELED / SUBSCRIPTION_EXPIRED / REFUNDED → volta para free
     """
     # 1) Validação de token
     if KIRVANO_WEBHOOK_TOKEN:
-        # Kirvano manda o token que você configurou. Aceitamos via header ou query.
         token_query = request.query_params.get("token", "")
         token_received = x_kirvano_token or token_query
         if token_received != KIRVANO_WEBHOOK_TOKEN:
@@ -469,7 +625,6 @@ async def webhook_kirvano(
     CANCELA = {"SUBSCRIPTION_CANCELED", "SUBSCRIPTION_EXPIRED", "REFUNDED", "CHARGEBACK"}
 
     if event not in ATIVA and event not in CANCELA:
-        # registra e ignora (pix_gerado, boleto_gerado, etc.)
         return {"status": "ignored", "event": event}
 
     supa = get_supabase_admin()
@@ -477,15 +632,12 @@ async def webhook_kirvano(
         raise HTTPException(status_code=500, detail="Supabase admin não configurado no servidor.")
 
     # 4) Descobre usuário pelo e-mail
-    #    IMPORTANTE: a tabela profiles precisa ter coluna `email` espelhando o auth.users.email,
-    #    preenchida na criação do perfil. O schema SQL incluso já cuida disso.
     try:
         res = supa.table("profiles").select("id, email, plan").eq("email", email).limit(1).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro Supabase: {str(e)}")
 
     if not res.data:
-        # Usuário ainda não existe na plataforma — guarda a venda pendente
         try:
             supa.table("pending_subscriptions").insert({
                 "email": email,
@@ -505,7 +657,6 @@ async def webhook_kirvano(
         if not plano:
             return {"status": "warning", "reason": "produto_nao_mapeado", "products": [p.get("id") or p.get("name") for p in products]}
         supa.table("profiles").update({"plan": plano}).eq("id", user_row["id"]).execute()
-        # log da transação
         try:
             supa.table("subscription_events").insert({
                 "user_id": user_row["id"],
