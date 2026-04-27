@@ -595,6 +595,114 @@ REGRAS:
         raise HTTPException(status_code=500, detail=f"Erro ao gerar análise. Tente novamente em alguns segundos.")
 
 
+# ─────────────────────────────────────────
+# MÓDULO EMPRESA — Plano IA pra meta
+# ─────────────────────────────────────────
+class GerarPlanoMetaRequest(BaseModel):
+    user_id: str
+    meta_id: str
+    titulo: str
+    tipo: str
+    valor_alvo: Optional[float] = None
+    prazo: Optional[str] = None  # ISO date
+
+
+@app.post("/modulos/empresa/meta/plano")
+async def gerar_plano_meta(req: GerarPlanoMetaRequest):
+    """
+    Gera um plano de ação personalizado pra uma meta do cliente, usando contexto do perfil.
+    Salva no campo plano_ia da tabela business_goals.
+    """
+    try:
+        supa = get_supabase_admin()
+        if not supa:
+            raise HTTPException(status_code=500, detail="Supabase admin não configurado.")
+
+        # ─── Pega contexto do perfil ───
+        prof_resp = supa.table("profiles").select("company_name, sector, company_size, city").eq("id", req.user_id).limit(1).execute()
+        prof = prof_resp.data[0] if (prof_resp.data and len(prof_resp.data) > 0) else {}
+
+        # ─── Pega últimas 6 métricas pra dar contexto de números ───
+        met_resp = supa.table("business_metrics").select("mes, faturamento, num_clientes, num_vendas, ticket_medio") \
+            .eq("user_id", req.user_id).order("mes", desc=True).limit(6).execute()
+        metricas = met_resp.data or []
+
+        # ─── Monta o contexto ───
+        contexto_empresa = f"""EMPRESA:
+- Nome: {prof.get('company_name') or 'Não informado'}
+- Setor: {prof.get('sector') or 'Não informado'}
+- Tamanho: {prof.get('company_size') or 'Não informado'}
+- Cidade: {prof.get('city') or 'Não informado'}"""
+
+        contexto_metricas = ""
+        if metricas:
+            linhas = []
+            for m in metricas:
+                linhas.append(f"- {m.get('mes')}: faturamento R$ {m.get('faturamento') or 0:.2f}, "
+                             f"{m.get('num_clientes') or 0} clientes, {m.get('num_vendas') or 0} vendas, "
+                             f"ticket médio R$ {m.get('ticket_medio') or 0:.2f}")
+            contexto_metricas = "\n\nMÉTRICAS RECENTES (últimos meses):\n" + "\n".join(linhas)
+        else:
+            contexto_metricas = "\n\n(Cliente ainda não lançou métricas mensais.)"
+
+        contexto_meta = f"""
+
+META DEFINIDA PELO CLIENTE:
+- Título: {req.titulo}
+- Tipo: {req.tipo}
+- Valor alvo: {f'R$ {req.valor_alvo:.2f}' if req.valor_alvo else 'Não definido'}
+- Prazo: {req.prazo or 'Não definido'}"""
+
+        contexto_completo = contexto_empresa + contexto_metricas + contexto_meta
+
+        # ─── Prompt ───
+        system_prompt = """Você é o Arcane, consultor empresarial sênior brasileiro. Tom direto, sem enrolação.
+
+Sua tarefa: gerar um PLANO DE AÇÃO específico e prático pra essa meta. Considere o contexto da empresa e as métricas atuais (se houver) pra ser realista.
+
+ESTRUTURA OBRIGATÓRIA:
+
+## Análise da meta
+2-3 linhas dizendo se a meta é realista pro contexto, e qual o gap atual vs meta.
+
+## Plano de ação (5-7 passos)
+Cada passo numerado, com:
+- O que fazer (verbo no infinitivo + objeto específico)
+- Como fazer (1-2 frases concretas)
+- Prazo sugerido
+
+## Marcos de acompanhamento
+3-4 checkpoints intermediários pra acompanhar progresso.
+
+## Riscos
+2-3 coisas que podem derrubar o plano e como mitigar.
+
+REGRAS:
+- Seja específico com números quando o cliente forneceu valor alvo
+- Use a linguagem do dono de pequena empresa brasileiro
+- Markdown simples (## pra títulos, números pra ações)
+- Não termine com "boa sorte" ou despedidas
+- Máximo 800 palavras"""
+
+        plano_text = chamar_claude(system_prompt, contexto_completo, max_tokens=2500, temperature=0.4).strip()
+
+        # ─── Salva no banco ───
+        supa.table("business_goals").update({"plano_ia": plano_text}).eq("id", req.meta_id).eq("user_id", req.user_id).execute()
+
+        return {
+            "status": "sucesso",
+            "meta_id": req.meta_id,
+            "plano_ia": plano_text,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[empresa/meta/plano] ERRO: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Erro ao gerar plano. Tente novamente em alguns segundos.")
+
+
 @app.get("/modulos/arcane-teste/analise/{analysis_id}")
 async def buscar_analise(analysis_id: str, user_id: str):
     """
