@@ -399,6 +399,7 @@ Evite jargão vazio e blocos genéricos — entregue recomendações específica
 # MÓDULO ARCANE TESTE — Análise freemium com paywall
 # ─────────────────────────────────────────
 class ArcaneTesteRequest(BaseModel):
+    """Mantido por compatibilidade. A rota agora usa Form/UploadFile."""
     user_id: str
     setor: str
     funcionarios: str
@@ -408,123 +409,190 @@ class ArcaneTesteRequest(BaseModel):
     objetivos: List[str]
 
 
-@app.post("/modulos/arcane-teste/analisar")
-async def analisar_arcane_teste(req: ArcaneTesteRequest):
+# ─────────────────────────────────────────
+# Helper — extrair texto de arquivo enviado (CSV, Excel, PDF)
+# ─────────────────────────────────────────
+def extrair_texto_arquivo(arquivo: UploadFile, contents: bytes) -> str:
     """
-    Recebe dados estruturados do wizard, gera 2 versões via Claude:
-    - preview (~500 palavras): mostrado de graça, com gancho pra pagar
-    - completo: salvo no banco, só desbloqueia após pagamento R$47,90
-    Salva no Supabase e retorna só o preview.
+    Tenta extrair texto/dados do arquivo enviado.
+    Retorna string formatada pra incluir no contexto do Claude.
+    Em caso de erro, retorna mensagem indicando que falhou (não levanta exceção).
     """
+    nome = (arquivo.filename or "").lower()
     try:
-        # ─── Mapeia áreas pra nomes legíveis ───
-        AREA_LABELS = {
-            'fin': 'Financeiro',
-            'rh': 'RH e Pessoas',
-            'mkt': 'Marketing e Vendas',
-            'ops': 'Operações',
-            'jur': 'Jurídico',
-            'est': 'Estratégia'
-        }
-        areas_nomes = [AREA_LABELS.get(a, a) for a in req.areas]
+        if nome.endswith(".csv"):
+            df = pd.read_csv(io.BytesIO(contents))
+            # Limita a 50 linhas pra não estourar tokens
+            preview = df.head(50).to_string(index=False)
+            resumo = f"CSV com {len(df)} linhas e colunas: {list(df.columns)}\n\nPrimeiras linhas:\n{preview}"
+            return resumo[:4000]
 
-        # ─── Contexto formatado pra IA ───
-        contexto = f"""DADOS DA EMPRESA:
-- Setor: {req.setor}
-- Funcionários: {req.funcionarios}
-- Faturamento mensal: {req.faturamento}
-- Áreas com problema: {', '.join(areas_nomes)}
-- Objetivos da análise: {', '.join(req.objetivos)}
+        elif nome.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(io.BytesIO(contents))
+            preview = df.head(50).to_string(index=False)
+            resumo = f"Excel com {len(df)} linhas e colunas: {list(df.columns)}\n\nPrimeiras linhas:\n{preview}"
+            return resumo[:4000]
 
-DESCRIÇÃO DA SITUAÇÃO (palavras do empresário):
-{req.descricao}"""
+        elif nome.endswith(".pdf"):
+            doc = fitz.open(stream=contents, filetype="pdf")
+            texto = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            if not texto.strip():
+                return "[PDF enviado mas sem texto extraível — pode ser imagem/scan]"
+            return texto[:4000]
 
-        # ─── PREVIEW (~500 palavras, tom direto, termina criando expectativa) ───
-        system_preview = """Você é o Arcane, consultor empresarial sênior brasileiro com tom direto e objetivo. Sem enrolação. Foco em ação.
+        else:
+            return f"[Formato não suportado: {nome}]"
 
-Você está gerando o PREVIEW (parte gratuita) de um diagnóstico. Esse preview deve:
-- Identificar a dor central com clareza
-- Mostrar 1-2 insights iniciais que provem que você entendeu o problema
-- Apontar de forma resumida o RUMO da solução
-- TERMINAR criando expectativa: o cliente precisa querer ver o resto
+    except Exception as e:
+        return f"[Erro ao ler arquivo {nome}: {str(e)[:200]}]"
 
-REGRAS:
-- Máximo 500 palavras
-- Tom direto, sem clichês de consultor ("é importante notar", "vale ressaltar")
-- Use linguagem que o dono de pequeno negócio entende
-- Pode usar números aproximados quando fizer sentido
-- NÃO entregue o plano de ação completo (isso fica pro completo)
-- TERMINE com algo como "Identifiquei X ações concretas que vão resolver isso..." (deixa gancho)
 
-Responda em texto corrido, com parágrafos. SEM markdown, SEM listas com bullets."""
+@app.post("/modulos/arcane-teste/analisar")
+async def analisar_arcane_teste(
+    user_id: str = Form(...),
+    setor: str = Form(...),
+    funcionarios: str = Form(...),
+    faturamento: str = Form(...),
+    areas: str = Form(...),         # JSON-encoded list
+    descricao: str = Form(...),
+    objetivos: str = Form(...),     # JSON-encoded list
+    arquivo: Optional[UploadFile] = File(None),
+):
+    """
+    Recebe dados estruturados do wizard (+ arquivo opcional) e gera análise completa via Claude.
+    Limita a 3 análises grátis por usuário (verificado em profiles.arcane_teste_used).
+    Salva no Supabase e retorna a análise inteira (sem paywall).
+    """
+    LIMITE_FREE = 3
 
-        preview_text = chamar_claude(system_preview, contexto, max_tokens=1200, temperature=0.4).strip()
+    try:
+        # ─── Decode listas JSON enviadas como string ───
+        try:
+            areas_list = json.loads(areas) if isinstance(areas, str) else areas
+            objetivos_list = json.loads(objetivos) if isinstance(objetivos, str) else objetivos
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Campos 'areas' e 'objetivos' precisam ser JSON válido.")
 
-        # ─── COMPLETO (análise inteira) ───
-        system_completo = """Você é o Arcane, consultor empresarial sênior brasileiro com tom direto e objetivo. Sem enrolação. Foco em ação.
-
-Você está gerando a ANÁLISE COMPLETA (versão paga) de um diagnóstico. Estruture em 4 seções:
-
-1. DIAGNÓSTICO COMPLETO
-   - Análise profunda da situação
-   - Causas-raiz identificadas
-   - Riscos específicos se nada for feito
-
-2. PLANO DE AÇÃO (5-7 ações concretas)
-   - Cada ação numerada com o QUE fazer e COMO fazer
-   - Priorize por impacto x esforço
-   - Inclua prazos sugeridos
-
-3. ESTIMATIVA DE IMPACTO
-   - Quanto pode economizar/ganhar em R$ aplicando o plano
-   - Em qual prazo
-
-4. PRÓXIMOS PASSOS
-   - Por onde começar essa semana
-   - Quais decisões precisa tomar primeiro
-
-REGRAS:
-- Tom direto, sem clichês
-- Use números, prazos e nomes específicos quando possível
-- Linguagem do dono de pequeno negócio
-- Responda em texto corrido com seções numeradas
-
-Use markdown simples (## para títulos das 4 seções, números pra ações)."""
-
-        completo_text = chamar_claude(system_completo, contexto, max_tokens=3000, temperature=0.4).strip()
-
-        # ─── Salva no Supabase ───
+        # ─── Cliente Supabase admin ───
         supa = get_supabase_admin()
         if not supa:
             raise HTTPException(status_code=500, detail="Supabase admin não configurado.")
 
+        # ─── Verificar limite de gerações (3 grátis) ───
+        prof_resp = supa.table("profiles").select("arcane_teste_used, plan").eq("id", user_id).limit(1).execute()
+        if prof_resp.data and len(prof_resp.data) > 0:
+            prof_row = prof_resp.data[0]
+            usado = prof_row.get("arcane_teste_used") or 0
+            plano_atual = prof_row.get("plan") or "free"
+            # Usuários pagos não têm limite no Arcane Teste
+            if plano_atual == "free" and usado >= LIMITE_FREE:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Você já usou suas {LIMITE_FREE} análises gratuitas. Assine um plano para continuar."
+                )
+        else:
+            usado = 0
+
+        # ─── Mapeia áreas pra nomes legíveis ───
+        AREA_LABELS = {
+            'fin': 'Financeiro', 'rh': 'RH e Pessoas', 'mkt': 'Marketing e Vendas',
+            'ops': 'Operações', 'jur': 'Jurídico', 'est': 'Estratégia'
+        }
+        areas_nomes = [AREA_LABELS.get(a, a) for a in areas_list]
+
+        # ─── Processa arquivo se enviado ───
+        contexto_arquivo = ""
+        nome_arquivo = None
+        if arquivo and arquivo.filename:
+            contents = await arquivo.read()
+            if len(contents) > 0:
+                nome_arquivo = arquivo.filename
+                texto_arquivo = extrair_texto_arquivo(arquivo, contents)
+                contexto_arquivo = f"\n\nDADOS DO ARQUIVO ENVIADO ({nome_arquivo}):\n{texto_arquivo}"
+
+        # ─── Contexto formatado pra IA ───
+        contexto = f"""DADOS DA EMPRESA:
+- Setor: {setor}
+- Funcionários: {funcionarios}
+- Faturamento mensal: {faturamento}
+- Áreas com problema: {', '.join(areas_nomes)}
+- Objetivos da análise: {', '.join(objetivos_list)}
+
+DESCRIÇÃO DA SITUAÇÃO (palavras do empresário):
+{descricao}{contexto_arquivo}"""
+
+        # ─── ANÁLISE COMPLETA (sem paywall, entrega tudo) ───
+        system_prompt = """Você é o Arcane, consultor empresarial sênior brasileiro com tom direto e objetivo. Sem enrolação. Foco em ação.
+
+Você está gerando uma ANÁLISE COMPLETA do negócio. Estruture em 4 seções:
+
+## 1. DIAGNÓSTICO
+- Análise profunda da situação descrita
+- Causas-raiz identificadas
+- Riscos específicos se nada for feito
+- Se houver dados de arquivo (CSV/Excel/PDF), use-os pra dar números concretos
+
+## 2. PLANO DE AÇÃO (5-7 ações concretas)
+- Cada ação numerada com o QUE fazer e COMO fazer
+- Priorize por impacto x esforço
+- Inclua prazos sugeridos (essa semana, esse mês, próximos 90 dias)
+
+## 3. ESTIMATIVA DE IMPACTO
+- Quanto pode economizar/ganhar em R$ aplicando o plano
+- Em qual prazo
+- Use os dados do arquivo se houver, senão use benchmarks do setor
+
+## 4. PRÓXIMOS PASSOS
+- Por onde começar essa semana
+- Quais decisões precisa tomar primeiro
+- Quem precisa estar envolvido
+
+REGRAS:
+- Tom direto, sem clichês de consultor ("é importante notar", "vale ressaltar", "diante do exposto")
+- Use números, prazos e nomes específicos quando possível
+- Linguagem do dono de pequeno negócio brasileiro
+- Use markdown simples (## para títulos das 4 seções, números pra ações)
+- Não termine com "espero ter ajudado" ou despedidas — termine com a última ação prática"""
+
+        analise_text = chamar_claude(system_prompt, contexto, max_tokens=3500, temperature=0.4).strip()
+
+        # ─── Salva no Supabase ───
         result = supa.table("arcane_teste_analyses").insert({
-            "user_id": req.user_id,
-            "setor": req.setor,
-            "funcionarios": req.funcionarios,
-            "faturamento": req.faturamento,
-            "areas": req.areas,
-            "descricao": req.descricao,
-            "objetivos": req.objetivos,
-            "preview": preview_text,
-            "completo": completo_text,
-            "unlocked": False,
+            "user_id": user_id,
+            "setor": setor,
+            "funcionarios": funcionarios,
+            "faturamento": faturamento,
+            "areas": areas_list,
+            "descricao": descricao,
+            "objetivos": objetivos_list,
+            "preview": analise_text,        # mantemos a coluna pra compat, mas com a análise completa
+            "completo": analise_text,
+            "unlocked": True,               # sempre desbloqueado agora
         }).execute()
 
         analysis_id = result.data[0]["id"] if result.data else None
 
-        # ─── Retorna SÓ o preview ───
+        # ─── Incrementa contador ───
+        novo_contador = usado + 1
+        supa.table("profiles").update({"arcane_teste_used": novo_contador}).eq("id", user_id).execute()
+
+        # ─── Retorna análise completa ───
         return {
             "status": "sucesso",
             "analysis_id": analysis_id,
-            "preview": preview_text,
-            "unlocked": False,
+            "analise": analise_text,
+            "arcane_teste_used": novo_contador,
+            "limite_free": LIMITE_FREE,
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro: {str(e)}")
+        # Loga o stack trace completo no Railway pra facilitar debug, mas retorna mensagem amigável
+        import traceback
+        print(f"[arcane-teste] ERRO: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Erro ao gerar análise. Tente novamente em alguns segundos.")
 
 
 @app.get("/modulos/arcane-teste/analise/{analysis_id}")
