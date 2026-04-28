@@ -703,6 +703,202 @@ REGRAS:
         raise HTTPException(status_code=500, detail="Erro ao gerar plano. Tente novamente em alguns segundos.")
 
 
+# ─────────────────────────────────────────
+# MÓDULO EMPRESA — DRE Mensal via Upload (Profissional+)
+# ─────────────────────────────────────────
+@app.post("/modulos/empresa/dre/upload")
+async def upload_dre(
+    user_id: str = Form(...),
+    mes: str = Form(...),                       # ISO date "YYYY-MM-01"
+    arquivo: UploadFile = File(...),
+):
+    """
+    Recebe um extrato/planilha/PDF e usa Claude para:
+    1. Extrair lançamentos (data, descrição, valor)
+    2. Classificar cada um em: receita, dedução, CMV, despesa operacional (com subcategoria), despesa financeira
+    3. Calcular DRE estruturada
+    4. Gerar alertas/insights
+    Salva tudo em business_dre. Auto-preenche faturamento em business_metrics.
+    Restrito a plano Profissional+ (validado server-side).
+    """
+    try:
+        supa = get_supabase_admin()
+        if not supa:
+            raise HTTPException(status_code=500, detail="Supabase admin não configurado.")
+
+        # ─── Verifica plano (Profissional+) ───
+        prof_resp = supa.table("profiles").select("plan").eq("id", user_id).limit(1).execute()
+        plano = "free"
+        if prof_resp.data and len(prof_resp.data) > 0:
+            plano = prof_resp.data[0].get("plan") or "free"
+        if plano not in ("profissional", "gestao", "business", "unlimited"):
+            raise HTTPException(
+                status_code=403,
+                detail="DRE com IA é exclusivo do plano Profissional+. Faça upgrade para usar."
+            )
+
+        # ─── Lê arquivo ───
+        if not arquivo.filename:
+            raise HTTPException(status_code=400, detail="Nenhum arquivo enviado.")
+        contents = await arquivo.read()
+        if len(contents) == 0:
+            raise HTTPException(status_code=400, detail="Arquivo vazio.")
+
+        texto_extraido = extrair_texto_arquivo(arquivo, contents)
+        if texto_extraido.startswith("[") and "Erro" in texto_extraido:
+            raise HTTPException(status_code=400, detail=f"Não foi possível ler o arquivo: {texto_extraido}")
+
+        # ─── Pega contexto da empresa pra IA classificar melhor ───
+        ctx_resp = supa.table("profiles").select("company_name, sector, company_size").eq("id", user_id).limit(1).execute()
+        ctx = ctx_resp.data[0] if (ctx_resp.data and len(ctx_resp.data) > 0) else {}
+        contexto_empresa = f"Empresa: {ctx.get('company_name','?')} · Setor: {ctx.get('sector','?')} · Tamanho: {ctx.get('company_size','?')}"
+
+        # ─── Prompt: extrai DRE estruturada como JSON ───
+        system_prompt = """Você é o Arcane, contador/analista financeiro brasileiro. Sua tarefa: ler movimentações financeiras (extrato bancário, planilha de vendas/despesas, ou PDF) e produzir uma DRE Mensal estruturada (Demonstração de Resultado do Exercício) no padrão brasileiro de pequenas empresas.
+
+CLASSIFIQUE cada linha em UMA dessas categorias:
+- "receita_bruta": vendas, serviços prestados, recebimentos de clientes
+- "deducoes": impostos sobre vendas (Simples Nacional, ICMS, ISS, PIS/COFINS), devoluções, descontos concedidos
+- "cmv": custo direto da mercadoria vendida ou serviço prestado (matéria-prima, mão-de-obra direta)
+- "despesa_pessoal": salários, pró-labore, encargos, benefícios, FGTS
+- "despesa_marketing": anúncios, agências, assessoria, eventos
+- "despesa_administrativa": aluguel, água/luz, internet, contador, software, escritório, materiais
+- "despesa_outras": qualquer despesa operacional que não cabe acima
+- "despesa_financeira": juros, IOF, tarifas bancárias, multas, parcelamentos
+- "ignorar": transferências entre contas próprias, aplicações, resgates (não impacta DRE)
+
+REGRAS:
+- Retorne APENAS um JSON válido (sem markdown, sem ```json, sem texto fora do JSON)
+- Receitas são sempre POSITIVAS, todas as despesas/deduções são NEGATIVAS
+- Calcule margens como decimal (0.45 = 45%)
+- Se algum valor não for claro, faça melhor estimativa e mencione em "alertas"
+- Se identificar inconsistência (ex: "despesa muito alta em pessoal pra empresa do tamanho informado"), inclua em "alertas"
+
+ESTRUTURA EXATA do JSON de retorno:
+{
+  "receita_bruta": 0.00,
+  "deducoes": 0.00,
+  "receita_liquida": 0.00,
+  "cmv": 0.00,
+  "lucro_bruto": 0.00,
+  "despesas_operacionais": {
+    "pessoal": 0.00,
+    "marketing": 0.00,
+    "administrativo": 0.00,
+    "outras": 0.00
+  },
+  "ebitda": 0.00,
+  "despesas_financeiras": 0.00,
+  "lucro_liquido": 0.00,
+  "margem_bruta": 0.00,
+  "margem_liquida": 0.00,
+  "alertas": ["até 4 alertas curtos sobre pontos de atenção identificados"],
+  "classificacoes": [
+    {"descricao": "exemplo da linha", "valor": -100.00, "categoria": "despesa_administrativa"}
+  ]
+}
+
+A lista "classificacoes" deve conter no máximo 30 linhas (as mais relevantes), pra economizar tokens."""
+
+        user_content = f"""{contexto_empresa}
+
+Mês de referência: {mes}
+
+DADOS DO ARQUIVO ({arquivo.filename}):
+{texto_extraido}
+
+Gere a DRE estruturada como JSON conforme as regras."""
+
+        resposta = chamar_claude(system_prompt, user_content, max_tokens=4000, temperature=0.2)
+
+        # ─── Extrai JSON da resposta ───
+        try:
+            dre_data = extrair_json(resposta)
+        except Exception as e:
+            print(f"[empresa/dre/upload] JSON inválido: {resposta[:500]}")
+            raise HTTPException(status_code=500, detail="A IA não retornou um JSON válido. Tente reenviar o arquivo.")
+
+        # ─── Defesa: garante campos numéricos ───
+        def _num(v, default=0):
+            try: return float(v) if v is not None else default
+            except: return default
+
+        despesas_op = dre_data.get("despesas_operacionais") or {}
+        receita_bruta   = _num(dre_data.get("receita_bruta"))
+        deducoes        = _num(dre_data.get("deducoes"))
+        receita_liquida = _num(dre_data.get("receita_liquida"))
+        cmv             = _num(dre_data.get("cmv"))
+        lucro_bruto     = _num(dre_data.get("lucro_bruto"))
+        ebitda          = _num(dre_data.get("ebitda"))
+        desp_fin        = _num(dre_data.get("despesas_financeiras"))
+        lucro_liquido   = _num(dre_data.get("lucro_liquido"))
+        margem_bruta    = _num(dre_data.get("margem_bruta"))
+        margem_liquida  = _num(dre_data.get("margem_liquida"))
+        alertas         = dre_data.get("alertas") or []
+        classificacoes  = dre_data.get("classificacoes") or []
+
+        # ─── Salva DRE (upsert manual: se já existe pra esse mês, atualiza) ───
+        existing = supa.table("business_dre").select("id").eq("user_id", user_id).eq("mes", mes).limit(1).execute()
+        record = {
+            "user_id": user_id,
+            "mes": mes,
+            "arquivo_nome": arquivo.filename,
+            "receita_bruta": receita_bruta,
+            "deducoes": deducoes,
+            "receita_liquida": receita_liquida,
+            "cmv": cmv,
+            "lucro_bruto": lucro_bruto,
+            "despesas_operacionais": despesas_op,
+            "ebitda": ebitda,
+            "despesas_financeiras": desp_fin,
+            "lucro_liquido": lucro_liquido,
+            "margem_bruta": margem_bruta,
+            "margem_liquida": margem_liquida,
+            "alertas": alertas,
+            "classificacoes_raw": classificacoes,
+        }
+        if existing.data and len(existing.data) > 0:
+            dre_id = existing.data[0]["id"]
+            supa.table("business_dre").update(record).eq("id", dre_id).execute()
+        else:
+            ins = supa.table("business_dre").insert(record).execute()
+            dre_id = ins.data[0]["id"] if ins.data else None
+
+        # ─── Auto-atualiza faturamento em business_metrics (se já existe linha do mês, atualiza só faturamento) ───
+        try:
+            metric_existing = supa.table("business_metrics").select("id, num_vendas").eq("user_id", user_id).eq("mes", mes).limit(1).execute()
+            if metric_existing.data and len(metric_existing.data) > 0:
+                # Atualiza só o faturamento (e recalcula ticket se tiver vendas registradas)
+                vendas = metric_existing.data[0].get("num_vendas") or 0
+                ticket = (receita_bruta / vendas) if vendas > 0 else 0
+                supa.table("business_metrics").update({
+                    "faturamento": receita_bruta,
+                    "ticket_medio": ticket,
+                }).eq("id", metric_existing.data[0]["id"]).execute()
+            else:
+                # Cria nova com só o faturamento
+                supa.table("business_metrics").insert({
+                    "user_id": user_id, "mes": mes,
+                    "faturamento": receita_bruta,
+                    "num_clientes": 0, "num_vendas": 0, "ticket_medio": 0,
+                }).execute()
+        except Exception as sync_err:
+            print(f"[empresa/dre/upload] Aviso: falha ao sincronizar metrics: {sync_err}")
+
+        return {
+            "status": "sucesso",
+            "dre_id": dre_id,
+            "dre": record,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[empresa/dre/upload] ERRO: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Erro ao processar DRE. Tente novamente em alguns segundos.")
+
+
 @app.get("/modulos/arcane-teste/analise/{analysis_id}")
 async def buscar_analise(analysis_id: str, user_id: str):
     """
