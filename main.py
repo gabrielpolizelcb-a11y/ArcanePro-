@@ -81,7 +81,7 @@ def extrair_json(texto: str) -> dict:
     return json.loads(match.group())
 
 
-def chamar_claude(system: str, user_content: str, max_tokens: int = 1200, temperature: float = 0.3) -> str:
+def chamar_claude(system: str, user_content: str, max_tokens: int = 2500, temperature: float = 0.3) -> str:
     """Wrapper padrão para chamar Claude."""
     resposta = claude_client.messages.create(
         model=ANTHROPIC_MODEL,
@@ -139,7 +139,7 @@ Responda SOMENTE com JSON, sem texto fora dele, sem markdown.
 Estrutura obrigatória:
 {"saude_financeira": "Boa" ou "Razoavel" ou "Perigosa", "maior_ofensor": "categoria", "diagnostico": "até 3 parágrafos"}"""
 
-        texto = chamar_claude(system, f"Dados: {json.dumps(dados, ensure_ascii=False)}", max_tokens=800, temperature=0.2)
+        texto = chamar_claude(system, f"Dados: {json.dumps(dados, ensure_ascii=False)}", max_tokens=3000, temperature=0.2)
 
         return {
             "status": "sucesso",
@@ -184,7 +184,7 @@ Estrutura obrigatória:
         texto = chamar_claude(
             system,
             f"Analise este contrato ({total_paginas} páginas). Texto:\n\n{texto_resumido}",
-            max_tokens=1200,
+            max_tokens=3000,
             temperature=0.1,
         )
 
@@ -384,7 +384,7 @@ Evite jargão vazio e blocos genéricos — entregue recomendações específica
 
         user_content = "\n\n".join(partes_user)
 
-        texto = chamar_claude(system, user_content, max_tokens=1800, temperature=0.4)
+        texto = chamar_claude(system, user_content, max_tokens=5000, temperature=0.4)
 
         return {
             "status": "sucesso",
