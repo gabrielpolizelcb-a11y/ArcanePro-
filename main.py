@@ -73,7 +73,7 @@ def get_supabase_admin() -> Optional[Client]:
 # Utils
 # ─────────────────────────────────────────
 def extrair_json(texto: str) -> dict:
-    """Extrai JSON da resposta da IA."""
+    """Extrai JSON da resposta do Arcane."""
     texto = texto.strip()
     match = re.search(r'\{.*\}', texto, re.DOTALL)
     if not match:
@@ -511,7 +511,7 @@ async def analisar_arcane_teste(
                 texto_arquivo = extrair_texto_arquivo(arquivo, contents)
                 contexto_arquivo = f"\n\nDADOS DO ARQUIVO ENVIADO ({nome_arquivo}):\n{texto_arquivo}"
 
-        # ─── Contexto formatado pra IA ───
+        # ─── Contexto formatado pro Arcane ───
         contexto = f"""DADOS DA EMPRESA:
 - Setor: {setor}
 - Funcionários: {funcionarios}
@@ -596,7 +596,7 @@ REGRAS:
 
 
 # ─────────────────────────────────────────
-# MÓDULO EMPRESA — Plano IA pra meta
+# MÓDULO EMPRESA — Plano Arcane pra meta
 # ─────────────────────────────────────────
 class GerarPlanoMetaRequest(BaseModel):
     user_id: str
@@ -734,7 +734,7 @@ async def upload_dre(
         if plano not in ("profissional", "gestao", "business", "unlimited"):
             raise HTTPException(
                 status_code=403,
-                detail="DRE com IA é exclusivo do plano Profissional+. Faça upgrade para usar."
+                detail="DRE Arcane é exclusiva do plano Profissional+. Faça upgrade para usar."
             )
 
         # ─── Lê arquivo ───
@@ -748,7 +748,7 @@ async def upload_dre(
         if texto_extraido.startswith("[") and "Erro" in texto_extraido:
             raise HTTPException(status_code=400, detail=f"Não foi possível ler o arquivo: {texto_extraido}")
 
-        # ─── Pega contexto da empresa pra IA classificar melhor ───
+        # ─── Pega contexto da empresa pro Arcane classificar melhor ───
         ctx_resp = supa.table("profiles").select("company_name, sector, company_size").eq("id", user_id).limit(1).execute()
         ctx = ctx_resp.data[0] if (ctx_resp.data and len(ctx_resp.data) > 0) else {}
         contexto_empresa = f"Empresa: {ctx.get('company_name','?')} · Setor: {ctx.get('sector','?')} · Tamanho: {ctx.get('company_size','?')}"
@@ -816,7 +816,7 @@ Gere a DRE estruturada como JSON conforme as regras."""
             dre_data = extrair_json(resposta)
         except Exception as e:
             print(f"[empresa/dre/upload] JSON inválido: {resposta[:500]}")
-            raise HTTPException(status_code=500, detail="A IA não retornou um JSON válido. Tente reenviar o arquivo.")
+            raise HTTPException(status_code=500, detail="O Arcane não retornou um JSON válido. Tente reenviar o arquivo.")
 
         # ─── Defesa: garante campos numéricos ───
         def _num(v, default=0):
